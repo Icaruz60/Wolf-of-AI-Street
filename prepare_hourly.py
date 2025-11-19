@@ -75,6 +75,8 @@ def build_hourly():
 
     # move index back to a column named "time"
     df_h1 = df_h1.reset_index()
+    # DROP VOLUME COLUMN (useless = always zero)
+    df_h1 = df_h1.drop(columns=["volume"])
 
     print(df_h1.head())
     print("Rows (hours):", len(df_h1))
