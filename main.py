@@ -15,6 +15,7 @@ class Config:
     csv_path: str = "data/eurusd_hourly.csv"
     time_column: str = "time"
     close_column: str = "close"
+    news_column: str = "news_score"
 
     sequence_length: int = 24
     horizon: int = 1
@@ -43,7 +44,17 @@ class PriceDataset(Dataset):
 
         #normalize close
         close_norm = (close - close.mean()) / (close.std() + 1e-8)
-        self.features = close_norm.reshape(-1,1)
+        
+        #news stuff
+        if cfg.news_column in df.columns:
+            news = df[cfg.news_column].astype(float).values
+        else:
+            #placeholder
+            news = np.zeros_like(close)
+        #normalize news seperately
+        news_norm = (news - news.mean()) / (news.std() + 1e-8) if news.std() > 0 else np.zeros_like(news)
+
+        self.features = np.stack([close_norm, news_norm], axis=1)
 
         self.sequence_length = cfg.sequence_length
         self.horizon = cfg.horizon
@@ -185,7 +196,7 @@ def main():
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
 
     # ----- model setup -----
-    input_dim = 1  # only close price
+    input_dim = 2  #close price and news
     model = PriceLSTMRegressor(
         input_dim=input_dim,
         hidden_size=cfg.hidden_size,
