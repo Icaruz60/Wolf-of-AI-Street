@@ -30,7 +30,7 @@ MERGED_OUT_CSV = RAW_DIR / "eurusd_merged.csv"
 FINAL_OUT_CSV = DATA_DIR / "final_dataset.csv"
 
 TIMESTAMP_COL = "timestamp_utc"
-MIN_SCORE_DEFAULT = 15
+MIN_SCORE_DEFAULT = 21
 
 # This comes from your trim script
 START_TS = "2020-01-01 17:00:00+00:00"

@@ -1,19 +1,11 @@
 """
-LSTM on EUR/USD hourly data with news features (news-era only).
+Train an LSTM on EUR/USD hourly data with news features and
+evaluate it as a trading strategy using position sizing directly
+from the model's continuous [-1, 1]-like output.
 
-- Assumes a CSV with columns:
-    timestamp_utc, open, high, low, close,
-    news_count, news_score_sum, news_score_mean, news_score_max,
-    news_tone_avg, news_tone_pos, news_tone_neg, news_tone_polarity
-
-- Expected file: eurusd_merged_news_only.csv
-  (trimmed so that news_* features are actually meaningful).
-
-- Builds sliding windows of length seq_len and predicts next-hour return (normalized).
-- Uses robust normalization to avoid NaNs.
-- Prints detailed training / validation metrics, with special focus on
-  "significant trades" (sig_* metrics) and a threshold chosen on the
-  validation set to maximize expected normalized return.
+Instead of tuning a hard significance threshold, we simulate an
+equity curve where each hourly prediction controls the fraction
+of capital allocated long/short.
 """
 
 import os
@@ -26,6 +18,7 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
+
 # -------------------------------------------------
 # Device
 # -------------------------------------------------
@@ -37,28 +30,35 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # -------------------------------------------------
 @dataclass
 class Config:
-    # Use the trimmed file produced by trim_eurusd_news_era.py
+    # Data
     csv_path: str = "data/final_dataset.csv"
 
     seq_len: int = 72          # hours of context (3 days)
     batch_size: int = 64
+
+    # Model
     hidden_size: int = 64
     num_layers: int = 2
     dropout: float = 0.1
 
+    # Optimizer / training
     lr: float = 1e-3
     weight_decay: float = 0.0
-    num_epochs: int = 20
+    num_epochs: int = 100
 
     # Temporal split fractions
     train_frac: float = 0.70
     val_frac: float = 0.15  # rest is test
 
-    # Threshold grid in *normalized return space*
-    thr_grid: List[float] = None
+    # Early stopping based on validation PnL
+    early_stopping_patience: int = 5
+    early_stopping_min_delta: float = 0.0
 
-    # minimum significant coverage
-    min_sig_cov: float = 0.02
+    # Trading simulation parameters
+    initial_capital: float = 10_000.0
+    max_position: float = 0.5       # max fraction of capital long/short
+    position_scale: float = 1.0     # scale before tanh, controls saturation
+    pred_dead_zone: float = 0.0     # |pred| below this → no position
 
 
 # -------------------------------------------------
@@ -150,6 +150,9 @@ def build_features_and_target(df: pd.DataFrame):
     eps = 1e-12
     ret = np.log((close[1:] + eps) / (close[:-1] + eps))  # length N-1
 
+    # Timestamp aligned with the "next" bar (return of that hour)
+    timestamps = df["timestamp_utc"].values[1:]
+
     # Align features with target
     df_feat = df.iloc[:-1].copy()
     assert len(df_feat) == len(ret)
@@ -163,7 +166,7 @@ def build_features_and_target(df: pd.DataFrame):
     feature_cols = price_cols + [count_col, news_sum_col, news_mean_col, news_max_col] + tone_cols
     feat_arr = df_feat[feature_cols].astype(float).values  # (N-1, D)
 
-    return feat_arr, ret, feature_cols
+    return feat_arr, ret, feature_cols, timestamps
 
 
 def train_val_test_split_indices(n: int, train_frac: float, val_frac: float):
@@ -184,7 +187,7 @@ def load_and_prepare_data(cfg: Config):
     # Parse timestamps
     df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"])
 
-    feat_arr, ret, feature_cols = build_features_and_target(df)
+    feat_arr, ret, feature_cols, timestamps = build_features_and_target(df)
     n = len(ret)
     print(f"Dataset length (after building target): {n}")
 
@@ -201,6 +204,10 @@ def load_and_prepare_data(cfg: Config):
     y_train = ret[:idx_train_end]
     y_val = ret[idx_train_end:idx_val_end]
     y_test = ret[idx_val_end:]
+
+    ts_train = timestamps[:idx_train_end]
+    ts_val = timestamps[idx_train_end:idx_val_end]
+    ts_test = timestamps[idx_val_end:]
 
     print(f"Train: {len(y_train)}, Val: {len(y_val)}, Test: {len(y_test)}")
 
@@ -248,6 +255,9 @@ def load_and_prepare_data(cfg: Config):
         feature_cols,
         stats,
         target_stats,
+        ts_train,
+        ts_val,
+        ts_test,
     )
 
 
@@ -329,34 +339,125 @@ def collect_predictions(model, loader):
     return preds_all, y_all
 
 
-def threshold_scan(preds, y_true, thr_values: List[float]):
+# -------------------------------------------------
+# Trading simulation
+# -------------------------------------------------
+def simulate_equity(
+    preds_norm: np.ndarray,
+    true_norm: np.ndarray,
+    target_stats: Tuple[float, float],
+    cfg: Config,
+):
     """
-    Scan thresholds on |pred| in normalized space, compute:
-        - sig_acc: accuracy of sign on subset
-        - sig_cov: coverage (fraction of points where |pred| >= thr)
-        - sig_ret: average signed normalized return: sign(pred) * true
+    Simulate an equity curve where each hourly prediction controls
+    the fraction of capital allocated long/short.
+
+    - preds_norm, true_norm are in normalized space.
+    - We de-normalize true_norm back to log-returns.
+    - Position fraction f_t is derived by mapping preds_norm through
+      a tanh to obtain a stable [-1, 1] signal.
     """
-    results = []
-    for thr in thr_values:
-        mask = np.abs(preds) >= thr
-        cov = mask.mean() if len(mask) > 0 else 0.0
-        if mask.sum() == 0:
-            results.append((thr, 0.0, cov, 0.0))
-            continue
+    if preds_norm.size == 0 or true_norm.size == 0:
+        return np.array([cfg.initial_capital], dtype=np.float32), 0.0
 
-        pred_sub = preds[mask]
-        true_sub = y_true[mask]
+    y_mean, y_std = target_stats
+    # De-normalize log-returns
+    true_logret = true_norm * y_std + y_mean  # shape (T,)
 
-        sign_pred = np.sign(pred_sub)
-        sign_true = np.sign(true_sub)
+    capital = cfg.initial_capital
+    equity = [capital]
 
-        correct = (sign_pred == sign_true).sum()
-        sig_acc = correct / len(sign_true)
+    max_pos = cfg.max_position
+    scale = cfg.position_scale
+    dead_zone = cfg.pred_dead_zone
 
-        sig_ret = float(np.mean(sign_pred * true_sub))
-        results.append((thr, sig_acc, cov, sig_ret))
+    for p_raw, r in zip(preds_norm, true_logret):
+        # Map raw model output to [-1, 1] with tanh
+        p = float(np.tanh(scale * float(p_raw)))
 
-    return results
+        # Dead zone around zero: no position if confidence is too low
+        if abs(p) < dead_zone:
+            f = 0.0
+        else:
+            f = max_pos * p
+
+        # Convert log-return to simple price return
+        price_ret = float(np.exp(r) - 1.0)
+        # Capital update: capital_{t+1} = capital_t * (1 + f * price_ret)
+        capital *= (1.0 + f * price_ret)
+        equity.append(capital)
+
+    equity_arr = np.array(equity, dtype=np.float32)
+    total_log_ret = float(np.log(equity_arr[-1] / equity_arr[0]))
+    return equity_arr, total_log_ret
+
+
+# -------------------------------------------------
+# CSV dumping for inspection
+# -------------------------------------------------
+def dump_predictions_to_csv(
+    split_name: str,
+    preds_norm: np.ndarray,
+    true_norm: np.ndarray,
+    split_timestamps: np.ndarray,
+    target_stats: Tuple[float, float],
+    cfg: Config,
+    filename: str,
+):
+    """
+    Dump per-row predictions and returns for inspection.
+
+    For a given split (train/val/test) with target length L, the SeqDataset
+    yields predictions only for indices [seq_len, L-1]. The i-th prediction
+    from collect_predictions corresponds to target/return index:
+        idx = seq_len + i
+    in the split arrays.
+    """
+    if preds_norm.size == 0 or true_norm.size == 0:
+        print(f"No predictions for split '{split_name}', skipping CSV dump.")
+        return
+
+    if preds_norm.shape != true_norm.shape:
+        raise ValueError(f"Shape mismatch in dump_predictions_to_csv for '{split_name}'")
+
+    y_mean, y_std = target_stats
+    true_logret = true_norm * y_std + y_mean
+
+    # Map normalized predictions to trading signal and position fraction
+    signals = np.tanh(cfg.position_scale * preds_norm.astype(np.float64))
+    pos_frac = np.where(
+        np.abs(signals) < cfg.pred_dead_zone,
+        0.0,
+        cfg.max_position * signals,
+    )
+
+    # Compute simple returns for reference
+    simple_ret = np.exp(true_logret) - 1.0
+
+    # Map to timestamps: prediction i corresponds to target index seq_len + i
+    idx_offset = cfg.seq_len
+    max_idx = idx_offset + preds_norm.shape[0]
+    if max_idx > len(split_timestamps):
+        raise ValueError(
+            f"Not enough timestamps for split '{split_name}': "
+            f"needed up to index {max_idx}, have {len(split_timestamps)}"
+        )
+
+    ts_used = split_timestamps[idx_offset:max_idx]
+
+    df_out = pd.DataFrame(
+        {
+            "timestamp_utc": ts_used,
+            "pred_norm": preds_norm.astype(float),
+            "signal": signals.astype(float),
+            "position_fraction": pos_frac.astype(float),
+            "true_log_return": true_logret.astype(float),
+            "true_simple_return": simple_ret.astype(float),
+        }
+    )
+
+    df_out.to_csv(filename, index=False)
+    print(f"Saved {split_name} predictions to {filename} (rows={len(df_out)})")
 
 
 # -------------------------------------------------
@@ -364,12 +465,6 @@ def threshold_scan(preds, y_true, thr_values: List[float]):
 # -------------------------------------------------
 def main():
     cfg = Config()
-    if cfg.thr_grid is None:
-        # Dense grid from 0.0 to 1.0 in steps of 0.0005
-        #  -> 0.0000, 0.0005, 0.0010, ...
-        cfg.thr_grid = np.round(
-            np.arange(0.0, 1.0005, 0.0005), 4
-        ).tolist()
 
     print(f"Using device: {device}")
     print(f"CSV path: {cfg.csv_path}")
@@ -381,6 +476,9 @@ def main():
         feature_cols,
         feature_stats,
         target_stats,
+        ts_train,
+        ts_val,
+        ts_test,
     ) = load_and_prepare_data(cfg)
 
     input_size = len(feature_cols)
@@ -395,6 +493,12 @@ def main():
     criterion = nn.SmoothL1Loss()
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
+    best_state_dict = None
+    best_epoch = 0
+    best_val_log_ret = -1e9
+    best_val_equity_final = cfg.initial_capital
+    epochs_without_improvement = 0
+
     # -----------------------------
     # Training loop
     # -----------------------------
@@ -402,128 +506,98 @@ def main():
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer)
         val_loss, val_sign_acc = evaluate_loss_and_sign_acc(model, val_loader, criterion)
 
-        # Collect validation predictions for sig_* metrics
-        val_preds, val_true = collect_predictions(model, val_loader)
-        if len(val_preds) == 0:
-            val_sig_acc = 0.0
-            val_sig_cov = 0.0
-            val_sig_ret = 0.0
-            best_thr_epoch = 0.0
+        # Validation PnL simulation
+        val_preds, val_true_norm = collect_predictions(model, val_loader)
+        if val_preds.size == 0:
+            val_equity_curve = np.array([cfg.initial_capital], dtype=np.float32)
+            val_log_ret = 0.0
         else:
-            thr_results = threshold_scan(val_preds, val_true, cfg.thr_grid)
+            val_equity_curve, val_log_ret = simulate_equity(val_preds, val_true_norm, target_stats, cfg)
 
-            best_thr_epoch = None
-            best_sig_acc_epoch = -1.0
-            best_sig_cov_epoch = 0.0
-            best_sig_ret_epoch = 0.0
+        val_equity_final = float(val_equity_curve[-1])
 
-            for thr, sig_acc, sig_cov, sig_ret in thr_results:
-                # enforce minimum coverage
-                if sig_cov < cfg.min_sig_cov:
-                    continue
-                if sig_acc > best_sig_acc_epoch:
-                    best_sig_acc_epoch = sig_acc
-                    best_sig_cov_epoch = sig_cov
-                    best_sig_ret_epoch = sig_ret
-                    best_thr_epoch = thr
+        improved = False
+        if val_log_ret > best_val_log_ret + cfg.early_stopping_min_delta:
+            improved = True
 
-            # If nothing met coverage constraint, fall back to 0
-            if best_thr_epoch is None:
-                best_thr_epoch = 0.0
-                best_sig_acc_epoch = 0.0
-                best_sig_cov_epoch = 0.0
-                best_sig_ret_epoch = 0.0
-
-            val_sig_acc = best_sig_acc_epoch
-            val_sig_cov = best_sig_cov_epoch
-            val_sig_ret = best_sig_ret_epoch
+        if improved:
+            best_val_log_ret = val_log_ret
+            best_val_equity_final = val_equity_final
+            best_epoch = epoch
+            best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
 
         print(
             f"Epoch {epoch:02d} | "
             f"train_loss={train_loss:.6f} | "
             f"val_loss={val_loss:.6f} | "
             f"val_sign_acc={val_sign_acc:.3f} | "
-            f"val_sig_acc={val_sig_acc:.3f} | "
-            f"val_sig_cov={val_sig_cov:.3f} | "
-            f"val_sig_ret={val_sig_ret:.4f} | "
-            f"val_best_thr={best_thr_epoch:.4f}"
+            f"val_equity_final={val_equity_final:.2f} | "
+            f"val_log_ret={val_log_ret:.4f}"
         )
 
-    # -----------------------------
-    # Threshold search on validation set (final)
-    # -----------------------------
-    val_preds, val_true = collect_predictions(model, val_loader)
-    if len(val_preds) == 0:
-        print("No validation predictions (dataset too small with this seq_len). Skipping threshold scan.")
-        best_thr = 0.0
-        best_sig_acc = 0.0
-        best_sig_cov = 0.0
-        best_sig_ret = 0.0
-    else:
-        print("\nSearching best significance threshold on validation set...")
-        thr_results = threshold_scan(val_preds, val_true, cfg.thr_grid)
+        if epochs_without_improvement >= cfg.early_stopping_patience:
+            print(
+                f"Early stopping triggered at epoch {epoch}. "
+                f"Best epoch was {best_epoch} with val_log_ret={best_val_log_ret:.4f}."
+            )
+            break
 
-        best_thr = None
-        best_sig_acc = -1.0
-        best_sig_cov = 0.0
-        best_sig_ret = 0.0
-
-        for thr, sig_acc, sig_cov, sig_ret in thr_results:
-
-            # enforce minimum coverage
-            if sig_cov < cfg.min_sig_cov:
-                continue
-
-            if sig_acc > best_sig_acc:
-                best_sig_acc = sig_acc
-                best_sig_cov = sig_cov
-                best_sig_ret = sig_ret
-                best_thr = thr
-
-        if best_thr is None:
-            best_thr = 0.0
-            best_sig_acc = 0.0
-            best_sig_cov = 0.0
-            best_sig_ret = 0.0
-
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
         print(
-            f"\nChosen significance_threshold: {best_thr:.4f} "
-            f"(sig_acc={best_sig_acc:.3f}, sig_cov={best_sig_cov:.3f}, sig_ret={best_sig_ret:.4f})"
+            f"Restored best model from epoch {best_epoch} "
+            f"(val_log_ret={best_val_log_ret:.4f}, "
+            f"val_equity_final={best_val_equity_final:.2f})."
         )
+    else:
+        print("Warning: no improvement found during training; using last epoch model.")
 
     # -----------------------------
-    # Final test evaluation
+    # Final test evaluation (PnL)
     # -----------------------------
     test_loss, test_sign_acc = evaluate_loss_and_sign_acc(model, test_loader, criterion)
-    test_preds, test_true = collect_predictions(model, test_loader)
-    if len(test_preds) == 0:
-        test_sig_acc = test_sig_cov = test_sig_ret = 0.0
-        if best_thr is None:
-            best_thr = 0.0
+    test_preds, test_true_norm = collect_predictions(model, test_loader)
+    if test_preds.size == 0:
+        test_equity_curve = np.array([cfg.initial_capital], dtype=np.float32)
+        test_log_ret = 0.0
     else:
-        mask = np.abs(test_preds) >= best_thr
-        if mask.sum() == 0:
-            test_sig_acc = 0.0
-            test_sig_cov = 0.0
-            test_sig_ret = 0.0
-        else:
-            sign_pred = np.sign(test_preds[mask])
-            sign_true = np.sign(test_true[mask])
-            test_sig_acc = (sign_pred == sign_true).mean()
-            test_sig_cov = mask.mean()
-            test_sig_ret = float(np.mean(sign_pred * test_true[mask]))
+        test_equity_curve, test_log_ret = simulate_equity(test_preds, test_true_norm, target_stats, cfg)
+
+    test_equity_final = float(test_equity_curve[-1])
 
     print(
         f"TEST | loss={test_loss:.6f} | "
         f"sign_acc={test_sign_acc:.3f} | "
-        f"sig_acc={test_sig_acc:.3f} | "
-        f"sig_cov={test_sig_cov:.3f} | "
-        f"sig_ret={test_sig_ret:.4f} | "
-        f"thr={best_thr:.4f}"
+        f"equity_final={test_equity_final:.2f} | "
+        f"log_ret={test_log_ret:.4f}"
     )
 
-    torch.save(model.state_dict(), "price_lstm_with_news_signals.pt")
-    print("Saved model to price_lstm_with_news_signals.pt")
+    # Dump per-row predictions for inspection (validation and test)
+    val_preds_final, val_true_norm_final = collect_predictions(model, val_loader)
+    dump_predictions_to_csv(
+        "val",
+        val_preds_final,
+        val_true_norm_final,
+        ts_val,
+        target_stats,
+        cfg,
+        "val_predictions.csv",
+    )
+    dump_predictions_to_csv(
+        "test",
+        test_preds,
+        test_true_norm,
+        ts_test,
+        target_stats,
+        cfg,
+        "test_predictions.csv",
+    )
+
+    torch.save(model.state_dict(), "price_lstm_trader.pt")
+    print("Saved model to price_lstm_trader.pt")
 
 
 if __name__ == "__main__":
