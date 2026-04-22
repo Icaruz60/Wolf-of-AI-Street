@@ -14,6 +14,7 @@ from typing import Tuple, List
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
@@ -33,7 +34,7 @@ class Config:
     # Data
     csv_path: str = "data/final_dataset.csv"
 
-    seq_len: int = 72          # hours of context (3 days)
+    seq_len: int = 24          # hours of context (1 days)
     batch_size: int = 64
 
     # Model
@@ -58,7 +59,7 @@ class Config:
     initial_capital: float = 10_000.0
     max_position: float = 0.5       # max fraction of capital long/short
     position_scale: float = 1.0     # scale before tanh, controls saturation
-    pred_dead_zone: float = 0.0     # |pred| below this → no position
+    pred_dead_zone: float = 0.001     # |pred| below this → no position
 
 
 # -------------------------------------------------
@@ -338,6 +339,70 @@ def collect_predictions(model, loader):
     y_all = np.concatenate(y_list)
     return preds_all, y_all
 
+def compute_confusion_matrix(preds_norm: np.ndarray, true_norm: np.ndarray) -> np.ndarray:
+    """
+    Build a 2x2 confusion matrix on sign:
+    rows = true [Down, Up]
+    cols = pred [Down, Up]
+    """
+    if preds_norm.size == 0 or true_norm.size == 0:
+        return np.zeros((2, 2), dtype=int)
+
+    # Signs of normalized values (sign is invariant to mean/std scaling)
+    sign_pred = np.sign(preds_norm)
+    sign_true = np.sign(true_norm)
+
+    # Ignore cases where true sign is exactly 0 (flat)
+    mask = (sign_true != 0)
+    sign_pred = sign_pred[mask]
+    sign_true = sign_true[mask]
+
+    if sign_true.size == 0:
+        return np.zeros((2, 2), dtype=int)
+
+    # Map: Down = 0, Up = 1
+    true_idx = (sign_true > 0).astype(int)
+    pred_idx = (sign_pred > 0).astype(int)
+
+    cm = np.zeros((2, 2), dtype=int)
+    for t, p in zip(true_idx, pred_idx):
+        cm[t, p] += 1
+
+    return cm
+
+
+def plot_confusion_matrix(cm: np.ndarray, classes, filename: str):
+    """
+    Simple confusion-matrix heatmap using matplotlib.
+    """
+    fig, ax = plt.subplots(figsize=(4, 4))
+    im = ax.imshow(cm, interpolation="nearest")
+    ax.set_title("Confusion Matrix (Test)")
+    ax.set_xticks(np.arange(len(classes)))
+    ax.set_yticks(np.arange(len(classes)))
+    ax.set_xticklabels(classes)
+    ax.set_yticklabels(classes)
+
+    ax.set_ylabel("True label")
+    ax.set_xlabel("Predicted label")
+
+    # Rotate x tick labels a bit
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+    # Annotate cells with counts
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(
+                j, i,
+                str(cm[i, j]),
+                ha="center",
+                va="center",
+            )
+
+    fig.tight_layout()
+    fig.savefig(filename, dpi=200)
+    plt.close(fig)
+
 
 # -------------------------------------------------
 # Trading simulation
@@ -502,6 +567,14 @@ def main():
     # -----------------------------
     # Training loop
     # -----------------------------
+    # Metric history for plotting
+    history_epochs: List[int] = []
+    history_train_loss: List[float] = []
+    history_val_loss: List[float] = []
+    history_val_sign_acc: List[float] = []
+    history_val_log_ret: List[float] = []
+    history_val_equity_final: List[float] = []
+
     for epoch in range(1, cfg.num_epochs + 1):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer)
         val_loss, val_sign_acc = evaluate_loss_and_sign_acc(model, val_loader, criterion)
@@ -515,6 +588,14 @@ def main():
             val_equity_curve, val_log_ret = simulate_equity(val_preds, val_true_norm, target_stats, cfg)
 
         val_equity_final = float(val_equity_curve[-1])
+
+        # Log metrics for plotting
+        history_epochs.append(epoch)
+        history_train_loss.append(train_loss)
+        history_val_loss.append(val_loss)
+        history_val_sign_acc.append(val_sign_acc)
+        history_val_log_ret.append(val_log_ret)
+        history_val_equity_final.append(val_equity_final)
 
         improved = False
         if val_log_ret > best_val_log_ret + cfg.early_stopping_min_delta:
@@ -555,6 +636,54 @@ def main():
     else:
         print("Warning: no improvement found during training; using last epoch model.")
 
+     # -----------------------------
+    # Plot training curves
+    # -----------------------------
+    if history_epochs:
+        epochs = history_epochs
+
+        plt.figure(figsize=(12, 8))
+
+        # 1) Train vs Val loss
+        plt.subplot(2, 2, 1)
+        plt.plot(epochs, history_train_loss, label="Train loss")
+        plt.plot(epochs, history_val_loss, label="Val loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Train vs Val Loss")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # 2) Validation sign accuracy
+        plt.subplot(2, 2, 2)
+        plt.plot(epochs, history_val_sign_acc, label="Val sign acc")
+        plt.xlabel("Epoch")
+        plt.ylabel("Accuracy")
+        plt.title("Validation Sign Accuracy")
+        plt.ylim(0.0, 1.0)
+        plt.grid(True, alpha=0.3)
+
+        # 3) Validation equity final
+        plt.subplot(2, 2, 3)
+        plt.plot(epochs, history_val_equity_final, label="Val equity final")
+        plt.xlabel("Epoch")
+        plt.ylabel("Equity")
+        plt.title("Validation Equity (Final)")
+        plt.grid(True, alpha=0.3)
+
+        # 4) Validation log return
+        plt.subplot(2, 2, 4)
+        plt.plot(epochs, history_val_log_ret, label="Val log return")
+        plt.xlabel("Epoch")
+        plt.ylabel("Log return")
+        plt.title("Validation Log Return")
+        plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig("training_metrics.png", dpi=200)
+        plt.close()
+        print("Saved training plots to training_metrics.png")
+
     # -----------------------------
     # Final test evaluation (PnL)
     # -----------------------------
@@ -574,6 +703,29 @@ def main():
         f"equity_final={test_equity_final:.2f} | "
         f"log_ret={test_log_ret:.4f}"
     )
+    # -----------------------------
+    # Confusion matrix on test sign predictions
+    # -----------------------------
+    if test_preds.size > 0:
+        cm_test = compute_confusion_matrix(test_preds, test_true_norm)
+        print("Test confusion matrix (rows=true [Down, Up], cols=pred [Down, Up]):")
+        print(cm_test)
+        plot_confusion_matrix(cm_test, classes=["Down", "Up"], filename="test_confusion_matrix.png")
+        print("Saved test confusion matrix to test_confusion_matrix.png")
+    
+     # Plot test equity curve
+    if test_equity_curve.size > 1:
+        plt.figure(figsize=(8, 4))
+        plt.plot(test_equity_curve)
+        plt.xlabel("Time step")
+        plt.ylabel("Equity")
+        plt.title("Test Equity Curve")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig("test_equity_curve.png", dpi=200)
+        plt.close()
+        print("Saved test equity curve to test_equity_curve.png")
+
 
     # Dump per-row predictions for inspection (validation and test)
     val_preds_final, val_true_norm_final = collect_predictions(model, val_loader)

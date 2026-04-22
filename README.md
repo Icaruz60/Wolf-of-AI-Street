@@ -4,4 +4,4 @@ LSTM Model + Bot that predict the value of EUR/USD in the next hour on a 1 to -1
 
 To run model. In project root bash, run:
 .venv\Scripts\activate
-python main.py
+python train_trader.py
